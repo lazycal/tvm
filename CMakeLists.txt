@@ -22,6 +22,7 @@ endif()
 # You can create a config.cmake at build folder
 # and add set(OPTION VALUE) to override these build options.
 # Alernatively, use cmake -DOPTION=VALUE through command-line.
+tvm_option(USE_COV "Build with coverage" ON)
 tvm_option(USE_CUDA "Build with CUDA" OFF)
 tvm_option(USE_OPENCL "Build with OpenCL" OFF)
 tvm_option(USE_VULKAN "Build with Vulkan" OFF)
@@ -48,7 +49,7 @@ tvm_option(USE_TF_TVMDSOOP "Build with TensorFlow TVMDSOOp" OFF)
 tvm_option(USE_FALLBACK_STL_MAP "Use TVM's POD compatible Map" OFF)
 tvm_option(USE_ETHOSN "Build with Arm Ethos-N" OFF)
 tvm_option(INDEX_DEFAULT_I64 "Defaults the index datatype to int64" ON)
-tvm_option(USE_LIBBACKTRACE "Build libbacktrace to supply linenumbers on stack traces" AUTO)
+tvm_option(USE_LIBBACKTRACE "Build libbacktrace to supply linenumbers on stack traces" OFF)
 tvm_option(BUILD_STATIC_RUNTIME "Build static version of libtvm_runtime" OFF)
 
 # 3rdparty libraries
@@ -500,6 +501,10 @@ if(USE_THREADS AND NOT BUILD_FOR_HEXAGON)
   find_package(Threads REQUIRED)
   target_link_libraries(tvm PUBLIC Threads::Threads)
   target_link_libraries(tvm_runtime PUBLIC Threads::Threads)
+endif()
+
+if(USE_COV)
+  include(cmake/libs/Memcov.cmake)
 endif()
 
 target_link_libraries(tvm PRIVATE ${TVM_LINKER_LIBS} ${TVM_RUNTIME_LINKER_LIBS})
