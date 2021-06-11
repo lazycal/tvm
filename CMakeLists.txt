@@ -411,6 +411,7 @@ include(cmake/modules/contrib/Verilator.cmake)
 include(cmake/modules/Git.cmake)
 include(cmake/modules/LibInfo.cmake)
 include(cmake/modules/RustExt.cmake)
+include(cmake/modules/contrib/Memcov.cmake)
 
 include(CheckCXXCompilerFlag)
 if(NOT MSVC)
@@ -451,6 +452,11 @@ target_compile_definitions(tvm_runtime PUBLIC DMLC_USE_LOGGING_LIBRARY=<tvm/runt
 
 # logging option for libbacktrace
 include(cmake/modules/Logging.cmake)
+
+if(USE_COV)
+  target_compile_options(tvm_objs PRIVATE -fsanitize-coverage=trace-pc-guard)
+  target_compile_options(tvm_runtime_objs PRIVATE -fsanitize-coverage=trace-pc-guard)
+endif()
 
 if(USE_MICRO)
   # NOTE: cmake doesn't track dependencies at the file level across subdirectories. For the
@@ -501,10 +507,6 @@ if(USE_THREADS AND NOT BUILD_FOR_HEXAGON)
   find_package(Threads REQUIRED)
   target_link_libraries(tvm PUBLIC Threads::Threads)
   target_link_libraries(tvm_runtime PUBLIC Threads::Threads)
-endif()
-
-if(USE_COV)
-  include(cmake/libs/Memcov.cmake)
 endif()
 
 target_link_libraries(tvm PRIVATE ${TVM_LINKER_LIBS} ${TVM_RUNTIME_LINKER_LIBS})
