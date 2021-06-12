@@ -1,14 +1,22 @@
-import tvm
+from tvm._ffi.base import _LIB
+import ctypes
 
 # Because `tvm.contrib.coverage.now` relies on tvm's registry function, so after 
 # calling `reset`, the coverage will not be ZERO (but very small, e.g., 6).
-reset = tvm.get_global_func("tvm.contrib.coverage.reset")
+reset = _LIB.mcov_reset
 
-get_total = tvm.get_global_func("tvm.contrib.coverage.get_total")
-get_now = tvm.get_global_func("tvm.contrib.coverage.get_now")
+get_total = _LIB.mcov_get_total
+get_now = _LIB.mcov_get_now
 
-set_total = tvm.get_global_func("tvm.contrib.coverage.set_total")
-set_now = tvm.get_global_func("tvm.contrib.coverage.set_now")
+set_now = _LIB.mcov_set_now
 
-get_hitmap = tvm.get_global_func("tvm.contrib.coverage.get_hitmap")
-set_hitmap = tvm.get_global_func("tvm.contrib.coverage.set_hitmap")
+_char_array = ctypes.c_char * get_total()
+
+def get_hitmap():
+    hitmap_buffer = bytearray(get_total())
+    _LIB.mcov_copy_hitmap(_char_array.from_buffer(hitmap_buffer))
+    return hitmap_buffer
+
+def set_hitmap(data):
+    assert len(data) == get_total()
+    _LIB.mcov_set_hitmap(_char_array.from_buffer(data))
