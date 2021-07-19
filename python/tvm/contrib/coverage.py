@@ -5,6 +5,9 @@ import ctypes
 # calling `reset`, the coverage will not be ZERO (but very small, e.g., 6).
 reset = _LIB.mcov_reset
 
+push = _LIB.mcov_push_coverage
+pop = _LIB.mcov_pop_coverage
+
 get_total = _LIB.mcov_get_total
 get_now = _LIB.mcov_get_now
 
