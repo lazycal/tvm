@@ -44,6 +44,7 @@ For Developers
    contribute/index
    deploy/index
    dev/how_to
+   microtvm/index
    errors
    faq
 
@@ -76,8 +77,8 @@ For Developers
    :hidden:
    :caption: MISC
 
-   microtvm/index
    vta/index
+   profiling/index
 
 
 Index

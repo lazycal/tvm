@@ -44,9 +44,13 @@ tests/lint/python_format.sh
 
 echo "Linting the Python code..."
 tests/lint/pylint.sh
+tests/lint/flake8.sh
 
 echo "Lintinf the JNI code..."
 tests/lint/jnilint.sh
 
 echo "Checking C++ documentation..."
 tests/lint/cppdocs.sh
+
+echo "Type checking with MyPy ..."
+tests/scripts/task_mypy.sh

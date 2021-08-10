@@ -17,15 +17,13 @@
 """ Support level10 operator test cases.
 """
 import numpy as np
+import pytest
 import tvm
-from tvm import te
+import tvm.testing
 import tvm.topi.testing
-from tvm import relay
+from tvm import relay, te, topi
 from tvm.relay import transform
 from tvm.relay.testing import run_infer_type
-from tvm import topi
-import tvm.topi.testing
-import tvm.testing
 
 
 @tvm.testing.uses_gpu
@@ -328,17 +326,17 @@ def test_reverse_reshape():
     verify_reverse_reshape((2, 3, 4), (0, -3), (2, 12))
 
 
-def verify_batch_matmul(x_shape, y_shape, out_shape, dtype="float32"):
+def verify_batch_matmul(x_shape, y_shape, out_shape, dtype="float32", trans_x=False, trans_y=True):
     x = relay.var("x", relay.TensorType(x_shape, dtype))
     y = relay.var("y", relay.TensorType(y_shape, dtype))
-    z = relay.nn.batch_matmul(x, y)
+    z = relay.nn.batch_matmul(x, y, transpose_a=trans_x, transpose_b=trans_y)
     zz = run_infer_type(z)
     assert zz.checked_type == relay.ty.TensorType(out_shape, dtype)
 
     func = relay.Function([x, y], z)
     x_np = np.random.uniform(size=x_shape).astype(dtype)
     y_np = np.random.uniform(size=y_shape).astype(dtype)
-    z_np = tvm.topi.testing.batch_matmul(x_np, y_np)
+    z_np = tvm.topi.testing.batch_matmul(x_np, y_np, trans_x=trans_x, trans_y=trans_y)
 
     for target, dev in tvm.testing.enabled_targets():
         for kind in ["graph", "debug"]:
@@ -356,37 +354,13 @@ def test_batch_matmul():
     zz = run_infer_type(z)
     assert zz.checked_type == relay.TensorType((b, m, n), "float32")
 
-    verify_batch_matmul((1, 16, 32), (1, 16, 32), (1, 16, 16))
-    verify_batch_matmul((5, 16, 32), (5, 16, 32), (5, 16, 16))
-    verify_batch_matmul((5, 16, 32), (5, 20, 32), (5, 16, 20))
-    verify_batch_matmul((30, 16, 32), (30, 20, 32), (30, 16, 20))
-
-
-def verify_dynamic_batch_matmul(x_shape, y_shape, out_shape, dtype="float32"):
-    x = relay.var("x", relay.TensorType(x_shape, dtype))
-    y = relay.var("y", relay.TensorType((relay.Any(),) * len(y_shape), dtype))
-    z = relay.nn.batch_matmul(x, y)
-
-    func = relay.Function([x, y], z)
-    x_np = np.random.uniform(size=x_shape).astype(dtype)
-    y_np = np.random.uniform(size=y_shape).astype(dtype)
-    z_np = tvm.topi.testing.batch_matmul(x_np, y_np)
-
-    for target, dev in tvm.testing.enabled_targets():
-        for kind in ["vm", "debug"]:
-            mod = tvm.ir.IRModule.from_expr(func)
-            intrp = relay.create_executor(kind, mod=mod, device=dev, target=target)
-            z = intrp.evaluate()(x_np, y_np)
-            tvm.testing.assert_allclose(z.numpy(), z_np, rtol=1e-5)
-
-
-# TODO(mbrookhart): enable once VM supports heterogenous execution
-# @tvm.testing.uses_gpu
-def test_dynamic_batch_matmul():
-    verify_dynamic_batch_matmul((1, 16, 32), (1, 16, 32), (1, 16, 16))
-    verify_dynamic_batch_matmul((5, 16, 32), (5, 16, 32), (5, 16, 16))
-    verify_dynamic_batch_matmul((5, 16, 32), (5, 20, 32), (5, 16, 20))
-    verify_dynamic_batch_matmul((30, 16, 32), (30, 20, 32), (30, 16, 20))
+    verify_batch_matmul((1, 16, 32), (1, 16, 32), (1, 16, 16), trans_x=False, trans_y=True)
+    verify_batch_matmul((5, 16, 32), (5, 16, 32), (5, 16, 16), trans_x=False, trans_y=True)
+    verify_batch_matmul((5, 16, 32), (5, 20, 32), (5, 16, 20), trans_x=False, trans_y=True)
+    verify_batch_matmul((30, 16, 32), (30, 20, 32), (30, 16, 20), trans_x=False, trans_y=True)
+    verify_batch_matmul((1, 32, 16), (1, 16, 32), (1, 16, 16), trans_x=True, trans_y=True)
+    verify_batch_matmul((5, 16, 32), (5, 32, 16), (5, 16, 16), trans_x=False, trans_y=False)
+    verify_batch_matmul((5, 32, 16), (5, 32, 20), (5, 16, 20), trans_x=True, trans_y=False)
 
 
 @tvm.testing.uses_gpu
@@ -577,16 +551,46 @@ def test_matrix_set_diag():
     _verify((2, 3, 4), (2, 4, 3), "int32", (-1, 2), "RIGHT_RIGHT")
 
 
+@tvm.testing.parametrize_targets
+def test_nll_loss(dev, target):
+    def _get_oshape(target_shape, reduction):
+        if reduction == "none":
+            return target_shape
+        else:
+            return []
+
+    def _verify(prediction_shape, reduction="mean", ignore_index=-100, dtype="float32"):
+        C = prediction_shape[1]
+        target_shape = prediction_shape[:1] + prediction_shape[2:]
+
+        predictions = relay.var("predictions", relay.TensorType(prediction_shape, dtype))
+        targets = relay.var("targets", relay.TensorType(target_shape, "int32"))
+        weights = relay.var("weights", relay.TensorType((C,), dtype))
+        out = relay.nn.nll_loss(predictions, targets, weights, reduction, ignore_index)
+        checked = run_infer_type(out)
+        assert checked.checked_type == relay.ty.TensorType(
+            _get_oshape(target_shape, reduction), dtype
+        )
+        func = relay.Function([predictions, targets, weights], out)
+        predictions_np = np.random.uniform(size=prediction_shape).astype(dtype)
+        targets_np = np.random.randint(0, C, target_shape).astype("int32")
+        weights_np = np.random.uniform(size=(C,)).astype(dtype)
+        out_np = tvm.topi.testing.nll_loss(
+            predictions_np, targets_np, weights_np, reduction, ignore_index
+        )
+
+        for kind in ["graph", "debug"]:
+            intrp = relay.create_executor(kind, device=dev, target=target)
+            out_relay = intrp.evaluate(func)(predictions_np, targets_np, weights_np)
+            tvm.testing.assert_allclose(out_relay.numpy(), out_np, rtol=1e-6, atol=1e-6)
+
+    _verify((10, 5))
+    _verify((10, 5, 2, 2))
+    _verify((10, 5), reduction="sum")
+    _verify((10, 5), reduction="none")
+    _verify((10, 5), ignore_index=3)
+    _verify((10, 5), dtype="float64")
+
+
 if __name__ == "__main__":
-    test_adaptive_pool()
-    test_collapse_sum_like()
-    test_broadcast_to()
-    test_broadcast_to_like()
-    test_slice_like()
-    test_reverse_reshape()
-    test_batch_matmul()
-    test_shape_of()
-    test_sequence_mask()
-    test_one_hot()
-    test_ndarray_size()
-    test_matrix_set_diag()
+    pytest.main([__file__])

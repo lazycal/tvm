@@ -749,14 +749,17 @@ class TVMScriptParser(Transformer):
                 node.call.func_name.span,
             )
 
-        if isinstance(func, Intrin) and func.stmt:
-            return call_with_error_reporting(
-                self.report_error,
-                node.call.func_name.span,
-                func.handle,
-                arg_list,
-                node.call.func_name.span,
-            )
+        if isinstance(func, Intrin):
+            if func.stmt:
+                return call_with_error_reporting(
+                    self.report_error,
+                    node.call.func_name.span,
+                    func.handle,
+                    arg_list,
+                    node.call.func_name.span,
+                )
+            else:
+                self.report_error(f"This intrinsic cannot be used as a statement.", node.call.span)
         elif isinstance(func, WithScopeHandler) and func.concise_scope and not func.def_symbol:
             func.enter_scope(node, self.context, arg_list, node.call.func_name.span)
             func.body = self.parse_body(node)
@@ -765,7 +768,11 @@ class TVMScriptParser(Transformer):
             func.handle(node, self.context, arg_list, node.call.func_name.span)
             return
 
-        self.report_error(f"Invalid Expr stmt {type(func).__name__}.", node.call.func_name.span)
+        self.report_error(
+            "Unexpected statement. Expected an assert, an intrinsic, a with statement, or a "
+            f"special statement, but got {type(func).__name__}.",
+            node.call.func_name.span,
+        )
 
     def transform_Slice(self, node):
         start = self.transform(node.start)
@@ -777,15 +784,18 @@ class TVMScriptParser(Transformer):
     def transform_Subscript(self, node):
         """Array access visitor.
 
-        By now only 2 types of Subscript are supported:
+        By now only 3 types of Subscript are supported:
             1. Buffer[index, index, ...], Buffer element access(BufferLoad & BufferStore)
                Var[index] Buffer element access()
             2. Buffer[start: stop, start: stop, ...], BufferRealize(realize(buffer[...]))
+            3. Array[index], Buffer element access
         """
 
         symbol = self.transform(node.params[0])
         if symbol is None:
-            self.report_error(f"Variable {node.value.id} is not defined.", node.params[0].span)
+            self.report_error(
+                f"Variable {node.params[0].id.name} is not defined.", node.params[0].span
+            )
 
         indexes = [self.transform(x) for x in node.params[1].values]
         if isinstance(symbol, tvm.tir.expr.Var):
@@ -803,6 +813,25 @@ class TVMScriptParser(Transformer):
             return BufferSlice(
                 symbol, indexes, self.report_error, span=tvm_span_from_synr(node.span)
             )
+        elif isinstance(symbol, tvm.container.Array):
+            if len(indexes) > 1:
+                self.report_error(
+                    "Array access should be one-dimension access, but the indices are "
+                    + str(indexes),
+                    node.span,
+                )
+            index = indexes[0]
+            if not isinstance(index, (int, tvm.tir.expr.IntImm)):
+                self.report_error(
+                    "Array access index expected int or IntImm, but got " + type(index),
+                    node.span,
+                )
+            if int(index) >= len(symbol):
+                self.report_error(
+                    f"Array access out of bound, size: {len(symbol)}, got index {index}.",
+                    node.span,
+                )
+            return symbol[int(index)]
         else:
             self.report_error(
                 f"Cannot subscript from a {type(symbol).__name__}. Only variables and "
@@ -844,7 +873,7 @@ class TVMScriptParser(Transformer):
             self.report_error("Unsupported Attribute expression.", node.object.span)
         if not hasattr(symbol, node.field.name):
             self.report_error(
-                f"Type {type(symbol)} does not have a field called `{node.field}`.", node.span
+                f"Type {type(symbol)} does not have a field called `{node.field.name}`.", node.span
             )
         res = getattr(symbol, node.field.name)
         return res
