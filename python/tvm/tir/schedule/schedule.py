@@ -79,6 +79,16 @@ def _parse_error_render_level(error_render_level: str) -> int:
     return _ERROR_RENDER_LEVEL.get(error_render_level)
 
 
+def _parse_seed(seed: Optional[int]) -> int:
+    if seed is None:
+        return -1
+    if not isinstance(seed, int):
+        raise TypeError(f"Expected `seed` to be int or None, but gets: {seed}")
+    if seed < 1 or seed > 2147483647:
+        raise ValueError(f"seed must be in the range [1, 2147483647], but gets: {seed}")
+    return seed
+
+
 @_register_object("tir.Schedule")
 class Schedule(Object):
     """The user-facing schedule class
@@ -98,6 +108,7 @@ class Schedule(Object):
         self,
         mod: Union[PrimFunc, IRModule],
         *,
+        seed: Optional[int] = None,
         debug_mask: Union[str, int] = "none",
         error_render_level: str = "detail",
     ) -> None:
@@ -107,6 +118,10 @@ class Schedule(Object):
         ----------
         mod : Union[PrimFunc, IRModule]
             The IRModule or PrimFunc to be scheduled
+        seed: Optional[int]
+            The seed value for schedule's random state
+            Note that None and -1 means use device random, otherwise only integer between 1 and
+            2147483647 is allowed.
         debug_mask : Union[str, int]
             Do extra correctness checking after the class creation and each time
             after calling the Replace method.
@@ -130,6 +145,7 @@ class Schedule(Object):
         self.__init_handle_by_constructor__(
             _ffi_api.TracedSchedule,  # type: ignore # pylint: disable=no-member
             _parse_mod(mod),
+            _parse_seed(seed),
             _parse_debug_mask(debug_mask),
             _parse_error_render_level(error_render_level),
         )
@@ -138,12 +154,14 @@ class Schedule(Object):
     def _create_non_traced(
         mod: Union[PrimFunc, IRModule],
         *,
+        seed: Optional[int] = None,
         debug_mask: Union[str, int] = "none",
         error_render_level: str = "detail",
     ) -> "Schedule":
         """Construct a non-traced TensorIR schedule class from an IRModule."""
         return _ffi_api.ConcreteSchedule(  # type: ignore # pylint: disable=no-member
             _parse_mod(mod),
+            _parse_seed(seed),
             _parse_debug_mask(debug_mask),
             _parse_error_render_level(error_render_level),
         )
@@ -189,6 +207,16 @@ class Schedule(Object):
             The new random seed, -1 if use device random, otherwise non-negative
         """
         return _ffi_api.ScheduleSeed(self, seed)  # type: ignore # pylint: disable=no-member
+
+    def fork_seed(self) -> int:
+        """Returns a forked random state as seed for new schedules
+
+        Returns
+        -------
+        seed : int
+            The forked random state, not the same as the current random state
+        """
+        return _ffi_api.ScheduleForkSeed(self)  # type: ignore # pylint: disable=no-member
 
     def show(self, rand_var: RAND_VAR_TYPE) -> str:
         """Returns a string representation of the value that the random variable evaluates to
@@ -267,6 +295,35 @@ class Schedule(Object):
         return _ffi_api.ScheduleRemoveRV(self, rand_var)  # type: ignore # pylint: disable=no-member
 
     ########## Schedule: Sampling ##########
+
+    def sample_categorical(
+        self,
+        candidates: List[int],
+        probs: List[float],
+        decision: Optional[int] = None,
+    ) -> ExprRV:
+        """Sample an integer given the probability distribution
+
+        Parameters
+        ----------
+        candidates : List[int]
+            The candidates to be sampled from
+        probs : List[float]
+            The probability of each candidate
+        decision : Optional[int]
+            The sampling decision, if any
+
+        Returns
+        -------
+        result : ExprRV
+            The random variable sampled from candidates
+        """
+        return _ffi_api.ScheduleSampleCategorical(  # type: ignore # pylint: disable=no-member
+            self,
+            candidates,
+            probs,
+            decision,
+        )
 
     ########## Schedule: Get blocks & loops ##########
     def get_block(
@@ -441,6 +498,65 @@ class Schedule(Object):
         # it will be checked later in C++ implementation
         # that there is at most one None in `factors`
         return _ffi_api.ScheduleSplit(self, loop, factors)  # type: ignore # pylint: disable=no-member
+
+    def reorder(self, *ordered_loops: List[LoopRV]) -> None:
+        """
+        Reorder a list of loops. It doesn't require the loops to be consecutive.
+        It requires:
+        1) The loops are in the same chain. That means: the loops can be ordered to [l_1, l_2, ... ,
+        l_n] where l_i is an ancestor of l_{i+1} and there are only single-branch loops between
+        l_1 and l_n (which also indicates they are under the same scope).
+        2) After reordering, the domain of an outer loop cannot depend on any of the inner loops.
+        3) For every block under the loop nests, its block binding must be affine, and the block
+        variables must be either data parallel or reduction.
+        4) No duplicated loops are allowed in the arguments.
+
+        Parameters
+        ----------
+        *ordered_loops : List[LoopRV]
+            The loops in the new order
+
+        Examples
+        --------
+
+        Before reorder, in TensorIR, the IR is:
+
+        .. code-block:: python
+
+            @tvm.script.tir
+            def before_reorder(a: ty.handle, b: ty.handle) -> None:
+                A = tir.match_buffer(a, (128, 128))
+                B = tir.match_buffer(b, (128, 128))
+                for i, j in tir.grid(128, 128):
+                    with tir.block([128, 128], "B") as [vi, vj]:
+                        B[vi, vj] = A[vi, vj] * 2.0
+
+        Create the schedule and do reorder:
+
+        .. code-block:: python
+
+            sch = tir.Schedule(before_reorder)
+            i, j = sch.get_loops(sch.get_block("B"))
+            sch.reorder(j, i)
+            print(tvm.script.asscript(sch.mod["main"]))
+
+        After applying reorder, the IR becomes:
+
+        .. code-block:: python
+
+            @tvm.script.tir
+            def after_reorder(a: ty.handle, b: ty.handle) -> None:
+                A = tir.match_buffer(a, (128, 128))
+                B = tir.match_buffer(b, (128, 128))
+                # Here j and i are reordered
+                for j, i in tir.grid(128, 128):
+                    with tir.block([128, 128], "B") as [vi, vj]:
+                        tir.bind(vi, i)
+                        tir.bind(vj, j)
+                        B[vi, vj] = A[vi, vj] * 2.0
+
+        """
+        _ffi_api.ScheduleReorder(self, ordered_loops)  # type: ignore # pylint: disable=no-member
 
     ########## Schedule: Manipulate ForKind ##########
 

@@ -19,12 +19,26 @@
 #ifndef TVM_TIR_SCHEDULE_PRIMITIVE_H_
 #define TVM_TIR_SCHEDULE_PRIMITIVE_H_
 
+#include <tvm/support/random_engine.h>
 #include <tvm/tir/schedule/state.h>
 
 namespace tvm {
 namespace tir {
 
 /******** Schedule: Sampling ********/
+/*!
+ * \brief Sample once category from candidates according to the probability weights.
+ * \param self The schedule to update
+ * \param rand_state The pointer to schedule's random state
+ * \param candidates The candidates
+ * \param probs The probability distribution of the candidates
+ * \param decision The sampling decision, if any
+ * \return The random variable sampled from candidates
+ */
+TVM_DLL int64_t SampleCategorical(support::LinearCongruentialEngine::TRandState* rand_state,
+                                  const Array<Integer>& candidates, const Array<FloatImm>& probs,
+                                  Optional<Integer>* decision);
+
 /******** Schedule: Get blocks & loops ********/
 /*!
  * \brief Retrieves blocks in a specific function with its name
@@ -63,6 +77,21 @@ TVM_DLL Array<StmtSRef> Split(ScheduleState self, const StmtSRef& loop_sref,
  * \return The sref to the fused loop
  */
 TVM_DLL StmtSRef Fuse(ScheduleState self, const Array<StmtSRef>& loop_srefs);
+/*!
+ * \brief Reorder a list of loops. It doesn't require the loops to be consecutive.
+ * It requires:
+ * 1) The loops are in the same chain. That means: the loops can be ordered to [l_1, l_2, ... ,
+ *     l_n] where l_i is an ancestor of l_{i+1} and there are only single-branch loops between
+ *     l_1 and l_n (which also indicates they are under the same scope).
+ * 2) After reordering, the domain of an outer loop cannot depend on any of the inner loops.
+ * 3) For every block under the loop nests, its block binding must be affine, and the block
+ *    variables must be either data parallel or reduction.
+ * 4) No duplicated loops are allowed in the arguments.
+ * \param self The state of the schedule
+ * \param ordered_loop_srefs An array of srefs which indicates the new order of loops
+ */
+TVM_DLL void Reorder(ScheduleState self, const Array<StmtSRef>& ordered_loop_srefs);
+
 /******** Schedule: Manipulate ForKind ********/
 /*!
  * \brief Parallelize the input loop. It requires:
