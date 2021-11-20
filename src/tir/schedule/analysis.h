@@ -19,10 +19,16 @@
 #ifndef TVM_TIR_SCHEDULE_ANALYSIS_H_
 #define TVM_TIR_SCHEDULE_ANALYSIS_H_
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/tir/schedule/state.h>
 
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
+
+#include "../../runtime/thread_storage_scope.h"
 
 namespace tvm {
 namespace tir {
@@ -69,11 +75,20 @@ StmtSRef GetSRefTreeRoot(const StmtSRef& sref);
  * \param self The schedule state
  * \param sref The sref whose scope is to be checked
  * \param require_stage_pipeline A boolean indicating whether to check stage pipeline
- * \throw ScheduleError if the sref has been the root of the AST (so it has no scope root), or its
- * scope root is not a stage pipeline
+ * \param require_subtree_compact_dataflow A boolean indicating whether to check
+ * subtree compact dataflow property. The scope root may have one or more subtrees rooted at
+ * its direct children, and this property requires all the blocks of the subtree
+ * that the specified sref is in to be complete block or reduction block.
+ * \throw ScheduleError if
+ * 1) the sref has been the root of the AST (so it has no scope root), or
+ * 2) require_stage_pipeline = true, but its scope root is not a stage pipeline
+ * 3) require_subtree_compact_dataflow = true, but the subtree that the sref is in doesn't satisfy
+ * the compact dataflow condition, i.e. a block in the subtree is neither complete block nor
+ * reduction block
  * \return The block sref to the scope root
  */
-StmtSRef GetScopeRoot(const ScheduleState& self, const StmtSRef& sref, bool require_stage_pipeline);
+StmtSRef GetScopeRoot(const ScheduleState& self, const StmtSRef& sref, bool require_stage_pipeline,
+                      bool require_subtree_compact_dataflow);
 
 /*!
  * \brief Checks whether the block is a complete block under the scope
@@ -128,18 +143,36 @@ void CheckReductionBlock(const ScheduleState& self, const StmtSRef& block_sref,
                          const StmtSRef& scope_root_sref);
 
 /*!
- * \brief Check whether a subtree on SRef tree has compact data flow, and throw an exception if the
- * subtree does not have compact data flow
- * \details For a given StmtSRef, We say the subtree rooted from the StmtSRef has "compact data
- * flow" property if:
- * - the scope root of the input subtree root has stage-pipeline property, and
- * - all its child blocks on SRef tree are complete blocks or reduction blocks.
+ * \brief Check if the block is a complete block or a reduction block under the scope
  * \param self The schedule state
- * \param subtree_root_sref The root of the subtree to be checked in the SRef tree
- * \throw ScheduleError If the subtree does not have compact data flow
- * \sa IsCompleteBlock, IsReductionBlock
+ * \param block_sref The sref of the block to be checked
+ * \param scope_root_sref The scope root of the block
+ * \throw ScheduleError If the block is neither a complete block nor a reduction block
  */
-void CheckSRefSubtreeCompactDataFlow(const ScheduleState& self, const StmtSRef& subtree_root_sref);
+void CheckCompleteOrReductionBlock(const ScheduleState& self, const StmtSRef& block_sref,
+                                   const StmtSRef& scope_root_sref);
+
+/*!
+ * \brief Check if the block is an output block, i.e. the block writes to at least a buffer that is
+ * not allocated under the current scope
+ * \param self The schedule state
+ * \param block_sref The block to be checked
+ * \param scope_root_sref The scope root of the block
+ * \return A boolean flag indicating if the block is an output block
+ */
+bool IsOutputBlock(const ScheduleState& self, const StmtSRef& block_sref,
+                   const StmtSRef& scope_root_sref);
+
+/*!
+ * \brief Check if the block is not an output block, i.e. all the buffers the block writes to
+ * are allocated under the current scope
+ * \param self The schedule state
+ * \param block_sref The block to be checked
+ * \param scope_root_sref The scope root of the block
+ * \throw ScheduleError if the block is an output block
+ */
+void CheckNotOutputBlock(const ScheduleState& self, const StmtSRef& block_sref,
+                         const StmtSRef& scope_root_sref);
 
 /******** Binding ********/
 /*!
@@ -224,6 +257,7 @@ Array<BlockRealize> GetChildBlockRealizeOnSRefTree(const StmtSRef& parent_sref);
  */
 BlockRealize CheckGetSingleChildBlockRealizeOnSRefTree(const ScheduleState& self,
                                                        const StmtSRef& parent_sref);
+
 /*!
  * \brief Get the BlockRealize of the input block
  * \param self The schedule state
@@ -231,6 +265,55 @@ BlockRealize CheckGetSingleChildBlockRealizeOnSRefTree(const ScheduleState& self
  * \return The BlockRealize of the input block
  */
 BlockRealize GetBlockRealize(const ScheduleState& self, const StmtSRef& block_sref);
+
+/******** Producer-consumer relation ********/
+
+/*!
+ * \brief Get the producer blocks to the given block under the given scope
+ * \param block_sref The block whose producers are to be retrieved
+ * \param scope The block scope where the given block is in
+ * \return The producer blocks of the specified block
+ */
+Array<StmtSRef> GetProducers(const StmtSRef& block_sref, const BlockScope& scope);
+
+/*!
+ * \brief Get the consumer blocks to the given block under the given scope
+ * \param block_sref The block whose consumers are to be retrieved
+ * \param scope The block scope where the given block is in
+ * \return The consumer blocks of the specified block
+ */
+Array<StmtSRef> GetConsumers(const StmtSRef& block_sref, const BlockScope& scope);
+
+/*!
+ * \brief A solution to split a ordered list of subtrees into two parts,
+ * where producers are on the LHS and consumers are on the RHS.
+ * For example, subtree[0, 3) are on the LHS, and subtree[3, 6) are on the RHS.
+ */
+struct ProducerConsumerSplit {
+  /*! \brief Indicates that all producers fall into `subtrees[0, last_producer_position]` */
+  int last_producer_position;
+  /*! \brief Indicates that all consumers fall into `subtrees[first_consumer_position, ...)` */
+  int first_consumer_position;
+  /*! \brief The number of given producers visited in `subtrees` */
+  int n_producers_visited;
+  /*! \brief The number of given consumers visited in `subtrees` */
+  int n_consumers_visited;
+  /*!
+   * \brief Find a split among the given `subtree`
+   * \param state The schedule state
+   * \param subtrees The ordered list of subtrees to be split
+   * \param producer_block_srefs The producers
+   * \param consumer_block_srefs The consumers
+   * \param block2realize If not null, the corresponding BlockRealize to each block in the scope
+   * will be saved in this map
+   * \return The valid split points are (last_producer_position, first_consumer_position]
+   * \throw ScheduleError is not valid split is found
+   */
+  static ProducerConsumerSplit Find(
+      const ScheduleState& state, const Array<Stmt>& subtrees,
+      const Array<StmtSRef>& producer_block_srefs, const Array<StmtSRef>& consumer_block_srefs,
+      std::unordered_map<const BlockNode*, const BlockRealizeNode*>* block2realize);
+};
 
 /******** Block-buffer relation ********/
 
@@ -245,6 +328,49 @@ BlockRealize GetBlockRealize(const ScheduleState& self, const StmtSRef& block_sr
  */
 Buffer GetNthAccessBuffer(const ScheduleState& self, const Block& block, int n, bool is_write);
 
+/******** Reduction Block Related ********/
+
+/*!
+ * \brief Convert the `init` and `body` of the input block to BufferStores
+ * \param self The schedule state
+ * \param block The block to be analyzed
+ * \return The BufferStores of the `init` and `body` of the input block
+ * \throw ScheduleError If the `init` or `body` is not BufferStore, or they don't write to the same
+ * buffer
+ */
+std::pair<BufferStore, BufferStore> GetBufferStoresFromReductionBlock(
+    const Optional<ScheduleState>& self, const Block& block);
+
+/*!
+ * \brief Check whether the input array of IterVars only contains data-parallel and reduction block
+ * iters
+ * \param iters The input array of IterVars to be checked
+ * \return A boolean indicating whether the input array of IterVars only contains data-parallel and
+ * reduction block iters
+ */
+bool ContainsOnlyDataParAndReductionBlockIter(const Array<IterVar>& iters);
+
+/*!
+ * \brief Check whether the block's reduction block iters are not used to index the block's output
+ * buffers
+ * \param block The block to be checked
+ * \return A boolean indicating whether the block's reduction block iters are not used to index the
+ * block's output buffer
+ */
+bool ReductionIterNotIndexOutputBuffer(const Block& block);
+
+/*!
+ * \brief Given a reduction identity and a reduction combiner, detect the corresponding commutative
+ * reducer, and extract the combiner lhs and combiner rhs
+ * \param self The schedule state
+ * \param identity The reduction identity to be analyzed
+ * \param combiner The reduction combiner to be analyzed
+ * \return The corresponding CommReducer, the combiner lhs and the combiner rhs
+ * \throw ScheduleError If no corresponding commutative reducer can be matched
+ */
+std::tuple<CommReducer, PrimExpr, PrimExpr> GetReducerAndCombinerLhsRhs(
+    const Optional<ScheduleState>& self, const PrimExpr& identity, const BufferStore& combiner);
+
 /******** Commutative Reducer ********/
 
 /*!
@@ -252,7 +378,7 @@ Buffer GetNthAccessBuffer(const ScheduleState& self, const Block& block, int n, 
  * \return The list of the registered reducer-getter functions
  * \sa ReducerRegistry
  */
-std::vector<TypedPackedFunc<CommReducer(DataType)>> GetReducerGetters();
+std::vector<runtime::TypedPackedFunc<CommReducer(DataType)>> GetReducerGetters();
 
 /*!
  * \brief Given the input identity and the combiner BufferStore of a reduction, extract the

@@ -28,7 +28,6 @@ import shutil
 import subprocess
 import sys
 
-
 _LOG = logging.getLogger(__name__)
 
 
@@ -48,10 +47,19 @@ ALL_PLATFORMS = (
     "zephyr",
 )
 
-# List of identifying strings for microTVM platforms for testing.
-# Must match PLATFORMS as defined in tvm/tests/micro/[platform]/conftest.py
-# TODO add a way to declare supported platforms to ProjectAPI
-ALL_MICROTVM_PLATFORMS = {
+# Extra scripts required to execute on provisioning
+# in [platform]/base-box/base_box_provision.sh
+EXTRA_SCRIPTS = {
+    "arduino": (),
+    "zephyr": ("docker/install/ubuntu_init_zephyr_project.sh",),
+}
+
+PACKER_FILE_NAME = "packer.json"
+
+
+# List of identifying strings for microTVM boards for testing.
+# TODO add a way to declare supported boards to ProjectAPI
+ALL_MICROTVM_BOARDS = {
     "arduino": (
         "due",
         "feathers2",
@@ -64,21 +72,12 @@ ALL_MICROTVM_PLATFORMS = {
         "wioterminal",
     ),
     "zephyr": (
-        "stm32f746xx_nucleo",
-        "stm32f746xx_disco",
-        "nrf5340dk",
+        "nucleo_f746zg",
+        "stm32f746g_disco",
+        "nrf5340dk_nrf5340_cpuapp",
         "mps2_an521",
     ),
 }
-
-# Extra scripts required to execute on provisioning
-# in [platform]/base-box/base_box_provision.sh
-EXTRA_SCRIPTS = {
-    "arduino": (),
-    "zephyr": ("docker/install/ubuntu_init_zephyr_project.sh",),
-}
-
-PACKER_FILE_NAME = "packer.json"
 
 
 def parse_virtualbox_devices():
@@ -362,7 +361,7 @@ def do_run_release_test(release_test_dir, platform, provider_name, test_config, 
         + _quote_cmd(
             [
                 f"apps/microtvm/reference-vm/{platform}/base-box/base_box_test.sh",
-                test_config["microtvm_platform"],
+                test_config["microtvm_board"],
             ]
         )
     )
@@ -376,26 +375,28 @@ def test_command(args):
     with open(test_config_file) as f:
         test_config = json.load(f)
 
-        # select microTVM test platform
-        microtvm_test_platform = test_config[args.microtvm_platform]
+        # select microTVM test config
+        microtvm_test_config = test_config[args.microtvm_board]
 
         for key, expected_type in REQUIRED_TEST_CONFIG_KEYS.items():
-            assert key in microtvm_test_platform and isinstance(
-                microtvm_test_platform[key], expected_type
+            assert key in microtvm_test_config and isinstance(
+                microtvm_test_config[key], expected_type
             ), f"Expected key {key} of type {expected_type} in {test_config_file}: {test_config!r}"
 
-        microtvm_test_platform["vid_hex"] = microtvm_test_platform["vid_hex"].lower()
-        microtvm_test_platform["pid_hex"] = microtvm_test_platform["pid_hex"].lower()
-        microtvm_test_platform["microtvm_platform"] = args.microtvm_platform
+        microtvm_test_config["vid_hex"] = microtvm_test_config["vid_hex"].lower()
+        microtvm_test_config["pid_hex"] = microtvm_test_config["pid_hex"].lower()
+        microtvm_test_config["microtvm_board"] = args.microtvm_board
 
     providers = args.provider
-    provider_passed = {p: False for p in providers}
 
-    release_test_dir = os.path.join(THIS_DIR, "release-test")
+    release_test_dir = os.path.join(THIS_DIR, f"release-test-{args.platform}")
 
-    if args.skip_build:
-        assert len(providers) == 1, "--skip-build was given, but >1 provider specified"
+    if args.skip_build or args.skip_destroy:
+        assert (
+            len(providers) == 1
+        ), "--skip-build and/or --skip-destroy was given, but >1 provider specified"
 
+    test_failed = False
     for provider_name in providers:
         try:
             if not args.skip_build:
@@ -406,21 +407,30 @@ def test_command(args):
                 release_test_dir,
                 args.platform,
                 provider_name,
-                microtvm_test_platform,
+                microtvm_test_config,
                 args.test_device_serial,
             )
-            provider_passed[provider_name] = True
+
+        except subprocess.CalledProcessError:
+            test_failed = True
+            sys.exit(
+                f"\n\nERROR: Provider '{provider_name}' failed the release test. "
+                "You can re-run it to reproduce the issue without building everything "
+                "again by passing the --skip-build and specifying only the provider that failed. "
+                "The VM is still running in case you want to connect it via SSH to "
+                "investigate further the issue, thus it's necessary to destroy it manually "
+                "to release the resources back to the host, like a USB device attached to the VM."
+            )
 
         finally:
-            if not args.skip_build and len(providers) > 1:
+            # if we reached out here do_run_release_test() succeeded, hence we can
+            # destroy the VM and release the resources back to the host if user haven't
+            # requested to not destroy it.
+            if not (args.skip_destroy or test_failed):
                 subprocess.check_call(["vagrant", "destroy", "-f"], cwd=release_test_dir)
                 shutil.rmtree(release_test_dir)
 
-        if not all(provider_passed[p] for p in provider_passed.keys()):
-            sys.exit(
-                "some providers failed release test: "
-                + ",".join(name for name, passed in provider_passed if not passed)
-            )
+    print(f'\n\nThe release tests passed on all specified providers: {", ".join(providers)}.')
 
 
 def release_command(args):
@@ -494,9 +504,20 @@ def parse_args():
         "--skip-build",
         action="store_true",
         help=(
-            "If given, assume a box has already been built in "
-            "the release-test subdirectory. Attach a USB device to this box and execute the "
-            "release test script--do not delete it."
+            "If given, assume a box has already been built in the release-test subdirectory, "
+            "so use that box to execute the release test script. If the tests fail the VM used "
+            "for testing will be left running for further investigation and will need to be "
+            "destroyed manually. If all tests pass on all specified providers no VM is left running, "
+            "unless --skip-destroy is given too."
+        ),
+    )
+    parser_test.add_argument(
+        "--skip-destroy",
+        action="store_true",
+        help=(
+            "Skip destroying the test VM even if all tests pass. Can only be used if a single "
+            "provider is specified. Default is to destroy the VM if all tests pass (and always "
+            "skip destroying it if a test fails)."
         ),
     )
     parser_test.add_argument(
@@ -511,10 +532,10 @@ def parse_args():
         platform_specific_parser = parser_test_platform_subparsers.add_parser(platform)
         platform_specific_parser.set_defaults(platform=platform)
         platform_specific_parser.add_argument(
-            "--microtvm-platform",
-            choices=ALL_MICROTVM_PLATFORMS[platform],
+            "--microtvm-board",
+            choices=ALL_MICROTVM_BOARDS[platform],
             required=True,
-            help="MicroTVM platfrom used for testing.",
+            help="MicroTVM board used for testing.",
         )
 
     # Options for release subcommand

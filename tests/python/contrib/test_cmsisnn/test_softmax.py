@@ -15,63 +15,68 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""CMSIS-NN integration tests: softmax"""
+"""CMSIS-NN integration tests: Softmax"""
 
-import pytest
 import sys
+import itertools
 
-import tvm
+import numpy as np
+import pytest
+
+import tvm.testing
 from tvm import relay
 from tvm.relay.op.contrib import cmsisnn
-import numpy as np
+
+from utils import (
+    skip_if_no_reference_system,
+    make_module,
+    count_num_calls,
+    get_range_for_dtype_str,
+)
+from tests.python.relay.aot.aot_test_utils import (
+    AOTTestModel,
+    AOT_CORSTONE300_RUNNER,
+    generate_ref_data,
+    compile_and_run,
+)
 
 
-def count_num_calls(mod):
-    class CallCounter(relay.ExprVisitor):
-        def __init__(self):
-            super().__init__()
-            self.count = 0
-
-        def visit_call(self, call):
-            if isinstance(call.op, tvm.ir.Op):
-                self.count += 1
-
-            super().visit_call(call)
-
-    counter = CallCounter()
-    for var in mod.get_global_vars():
-        counter.visit(mod[var.name_hint])
-    return counter.count
-
-
-def make_module(func):
-    func = relay.Function(relay.analysis.free_vars(func), func)
-    mod = tvm.IRModule.from_expr(func)
-    return relay.transform.InferType()(mod)
-
-
-def make_model(shape, zero_point, scale, in_dtype, out_dtype):
-    a = relay.var("a", shape=shape, dtype=in_dtype)
+def make_model(
+    shape, in_dtype, out_dtype, in_zero_point, in_scale, out_zero_point=-128, out_scale=1.0 / 256
+):
+    """Create a Relay Function / network model"""
+    a = relay.var("in0", shape=shape, dtype=in_dtype)
     dequantize = relay.qnn.op.dequantize(
         a,
-        input_scale=relay.const(scale, "float32"),
-        input_zero_point=relay.const(zero_point, "int32"),
+        input_scale=relay.const(in_scale, "float32"),
+        input_zero_point=relay.const(in_zero_point, "int32"),
     )
     softmax = relay.nn.softmax(dequantize)
     model = relay.qnn.op.quantize(
         softmax,
-        output_scale=relay.const(scale, "float32"),
-        output_zero_point=relay.const(zero_point, "int32"),
+        output_scale=relay.const(out_scale, "float32"),
+        output_zero_point=relay.const(out_zero_point, "int32"),
         out_dtype=out_dtype,
     )
     return model
 
 
-def test_softmax_int8():
-    model = make_model([1, 16, 16, 3], 64, 0.02, "int8", "int8")
+@skip_if_no_reference_system
+@pytest.mark.parametrize(["zero_point", "scale"], [[33, 0.256], [-64, 0.0128]])
+@tvm.testing.requires_cmsisnn
+def test_op_int8(zero_point, scale):
+    interface_api = "c"
+    use_unpacked_api = True
+    test_runner = AOT_CORSTONE300_RUNNER
+
+    dtype = "int8"
+    shape = [1, 16, 16, 3]
+    model = make_model(shape, dtype, dtype, zero_point, scale)
     orig_mod = make_module(model)
+
     cmsisnn_mod = cmsisnn.partition_for_cmsisnn(orig_mod)
 
+    # validate pattern matching
     attrs = [
         cmsisnn_mod[var.name_hint].attrs
         for var in cmsisnn_mod.get_global_vars()
@@ -80,7 +85,7 @@ def test_softmax_int8():
     assert any(attrs), "At least one function with external attributes was expected."
 
     compilers = [
-        key == "Compiler" and value == "cmsisnn" for attr in attrs for key, value in attr.items()
+        key == "Compiler" and value == "cmsis-nn" for attr in attrs for key, value in attr.items()
     ]
     assert any(compilers), "Module does not contain function for cmsisnn target."
 
@@ -88,10 +93,53 @@ def test_softmax_int8():
         cmsisnn_mod
     ), "Number of calls changed during partitioning"
 
+    # validate the output
+    in_min, in_max = get_range_for_dtype_str(dtype)
+    np.random.seed(0)
+    input_data = np.random.randint(in_min, high=in_max, size=shape, dtype=dtype)
+    inputs = {"in0": input_data}
+    params = {}
+    output_list = generate_ref_data(orig_mod["main"], inputs, params)
+    compile_and_run(
+        AOTTestModel(module=cmsisnn_mod, inputs=inputs, outputs=output_list, params=params),
+        test_runner,
+        interface_api,
+        use_unpacked_api,
+    )
 
-@pytest.mark.parametrize("in_dtype,out_dtype", [["uint8", "int8"], ["int8", "uint8"]])
-def test_softmax_not_int8(in_dtype, out_dtype):
-    model = make_model([1, 16, 16, 3], 64, 0.02, in_dtype, out_dtype)
+
+def parameterize_for_invalid_model(test):
+    in_dtype = ["uint8", "int8"]
+    out_dtype = ["uint8", "int8"]
+    zero_point = [-128, 64]
+    scale = [1.0 / 256, 0.2]
+    out_zero_point = [-128, 33]
+    out_scale = [1.0 / 256, 0.2]
+    all_combinations = itertools.product(
+        in_dtype, out_dtype, zero_point, scale, out_zero_point, out_scale
+    )
+    all_combinations = filter(
+        lambda parameters: not (
+            parameters[0] == "int8"
+            and parameters[1] == "int8"
+            and parameters[4] == -128
+            and parameters[5] == 1.0 / 256
+        ),
+        all_combinations,
+    )
+    return pytest.mark.parametrize(
+        ["in_dtype", "out_dtype", "zero_point", "scale", "out_zero_point", "out_scale"],
+        all_combinations,
+    )(test)
+
+
+@parameterize_for_invalid_model
+@tvm.testing.requires_cmsisnn
+def test_invalid_parameters(in_dtype, out_dtype, zero_point, scale, out_zero_point, out_scale):
+    model = make_model(
+        [1, 16, 16, 3], in_dtype, out_dtype, zero_point, scale, out_zero_point, out_scale
+    )
+
     orig_mod = make_module(model)
     cmsisnn_mod = cmsisnn.partition_for_cmsisnn(orig_mod)
 

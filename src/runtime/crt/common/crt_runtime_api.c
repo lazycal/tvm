@@ -183,7 +183,16 @@ int TVMModCreateFromCModule(const TVMModule* mod, TVMModuleHandle* out_handle) {
   return -1;
 }
 
+static const TVMModuleHandle kTVMModuleHandleUninitialized = (TVMModuleHandle)(~0UL);
+
+static TVMModuleHandle system_lib_handle;
+
 int TVMModFree(TVMModuleHandle mod) {
+  /* Never free system_lib_handler */
+  if (mod == system_lib_handle && system_lib_handle != kTVMModuleHandleUninitialized) {
+    return 0;
+  }
+
   tvm_module_index_t module_index;
   if (DecodeModuleHandle(mod, &module_index) != 0) {
     return -1;
@@ -192,10 +201,6 @@ int TVMModFree(TVMModuleHandle mod) {
   registered_modules[module_index] = NULL;
   return 0;
 }
-
-static const TVMModuleHandle kTVMModuleHandleUninitialized = (TVMModuleHandle)(~0UL);
-
-static TVMModuleHandle system_lib_handle;
 
 int SystemLibraryCreate(TVMValue* args, int* type_codes, int num_args, TVMValue* ret_val,
                         int* ret_type_codes) {
@@ -395,6 +400,8 @@ int RPCGetCRTMaxPacketSize(TVMValue* args, int* type_codes, int num_args, TVMVal
   return 0;
 }
 
+int TVMContribRandomFill(TVMValue* args, int* type_codes, int num_args, TVMValue* ret_val,
+                         int* ret_type_code);
 tvm_crt_error_t TVMInitializeRuntime() {
   int idx = 0;
   tvm_crt_error_t error = kTvmErrorNoError;
@@ -430,6 +437,10 @@ tvm_crt_error_t TVMInitializeRuntime() {
 
   if (error == kTvmErrorNoError) {
     error = TVMFuncRegisterGlobal("tvm.rpc.server.GetCRTMaxPacketSize", &RPCGetCRTMaxPacketSize, 0);
+  }
+
+  if (error == kTvmErrorNoError) {
+    error = TVMFuncRegisterGlobal("tvm.contrib.random.random_fill", &TVMContribRandomFill, 0);
   }
 
   if (error != kTvmErrorNoError) {
@@ -562,4 +573,21 @@ release_and_return : {
 // Default implementation, overridden by the platform runtime.
 __attribute__((weak)) tvm_crt_error_t TVMPlatformGenerateRandom(uint8_t* buffer, size_t num_bytes) {
   return kTvmErrorFunctionCallNotImplemented;
+}
+
+// Fill the tensor in args[0] with random data using TVMPlatformGenerateRandom.
+// Named to correspond with the analogous function in the C++ runtime.
+int TVMContribRandomFill(TVMValue* args, int* type_codes, int num_args, TVMValue* ret_val,
+                         int* ret_type_code) {
+  if (num_args != 1) {
+    return kTvmErrorFunctionCallNumArguments;
+  }
+
+  if (type_codes[0] != kTVMDLTensorHandle) {
+    return kTvmErrorFunctionCallWrongArgType;
+  }
+
+  DLTensor* tensor = (DLTensor*)args[0].v_handle;
+  TVMNDArray arr = {*tensor};
+  return TVMNDArray_RandomFill(&arr);
 }

@@ -129,11 +129,6 @@ class ScheduleStateNode : public Object {
   TVM_DLL void Replace(const tir::StmtSRef& src_sref, const Stmt& tgt_stmt,
                        const Map<Block, Block>& block_sref_reuse);
   /*!
-   * \brief Recalculate the `affine_binding` flag of the scope block info.
-   * \param scope_sref The sref to the interested scope block.
-   */
-  TVM_DLL void UpdateAffineFlag(const StmtSRef& scope_sref);
-  /*!
    * \brief Trigger the verification according to the `debug_mask` bitmask.
    * 1) If the bitmask `kVerifySRefTree` is on, verify the correctness of the sref tree.
    * 2) If the bitmask `kVerifyCachedFlags` is on, verify the correctness of `affine_binding`,
@@ -147,6 +142,12 @@ class ScheduleStateNode : public Object {
   /******** Property of blocks ********/
   /*! \brief Returns the BlockInfo correpsonding to the block sref */
   TVM_DLL BlockInfo GetBlockInfo(const StmtSRef& block_sref) const;
+  /*!
+   * \brief Recalculate the BlockInfo recursively under stmt.
+   * If stmt is a Block itself, we will not reset its affine binding flag unless it doesn't
+   * have block vars, since the affine flag depends on the outer scope of stmt.
+   */
+  TVM_DLL void UpdateScopeBlockInfo(const Stmt& stmt);
   /*!
    * \brief Get the BlockScope correpsonding to the sref of scope root block
    * \param scope_root The block sref to be retrieved

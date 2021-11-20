@@ -123,11 +123,29 @@ TVM_REGISTER_GLOBAL("tir.schedule.ScheduleRemoveRV")
 /******** (FFI) Sampling ********/
 TVM_REGISTER_GLOBAL("tir.schedule.ScheduleSampleCategorical")
     .set_body_method<Schedule>(&ScheduleNode::SampleCategorical);
+TVM_REGISTER_GLOBAL("tir.schedule.ScheduleSamplePerfectTile")
+    .set_body_method<Schedule>(&ScheduleNode::SamplePerfectTile);
 /******** (FFI) Get blocks & loops ********/
 TVM_REGISTER_GLOBAL("tir.schedule.ScheduleGetBlock")
     .set_body_method<Schedule>(&ScheduleNode::GetBlock);
 TVM_REGISTER_GLOBAL("tir.schedule.ScheduleGetLoops")
     .set_body_method<Schedule>(&ScheduleNode::GetLoops);
+TVM_REGISTER_GLOBAL("tir.schedule.ScheduleGetChildBlocks")
+    .set_body_typed([](Schedule self, ObjectRef rv) {
+      if (const auto* block_rv = rv.as<BlockRVNode>()) {
+        return self->GetChildBlocks(GetRef<BlockRV>(block_rv));
+      }
+      if (const auto* loop_rv = rv.as<LoopRVNode>()) {
+        return self->GetChildBlocks(GetRef<LoopRV>(loop_rv));
+      }
+      LOG(FATAL) << "TypeError: Cannot evaluate the random variable of type: " << rv->GetTypeKey()
+                 << ". Its value is: " << rv;
+      throw;
+    });
+TVM_REGISTER_GLOBAL("tir.schedule.ScheduleGetProducers")
+    .set_body_method<Schedule>(&ScheduleNode::GetProducers);
+TVM_REGISTER_GLOBAL("tir.schedule.ScheduleGetConsumers")
+    .set_body_method<Schedule>(&ScheduleNode::GetConsumers);
 /******** (FFI) Transform loops ********/
 TVM_REGISTER_GLOBAL("tir.schedule.ScheduleFuse").set_body_method<Schedule>(&ScheduleNode::Fuse);
 TVM_REGISTER_GLOBAL("tir.schedule.ScheduleSplit").set_body_method<Schedule>(&ScheduleNode::Split);
@@ -146,11 +164,17 @@ TVM_REGISTER_GLOBAL("tir.schedule.ScheduleCacheRead")
 TVM_REGISTER_GLOBAL("tir.schedule.ScheduleCacheWrite")
     .set_body_method<Schedule>(&ScheduleNode::CacheWrite);
 /******** (FFI) Compute location ********/
+TVM_REGISTER_GLOBAL("tir.schedule.ScheduleComputeAt")
+    .set_body_method<Schedule>(&ScheduleNode::ComputeAt);
+TVM_REGISTER_GLOBAL("tir.schedule.ScheduleReverseComputeAt")
+    .set_body_method<Schedule>(&ScheduleNode::ReverseComputeAt);
 TVM_REGISTER_GLOBAL("tir.schedule.ScheduleComputeInline")
     .set_body_method<Schedule>(&ScheduleNode::ComputeInline);
 TVM_REGISTER_GLOBAL("tir.schedule.ScheduleReverseComputeInline")
     .set_body_method<Schedule>(&ScheduleNode::ReverseComputeInline);
 /******** (FFI) Reduction ********/
+TVM_REGISTER_GLOBAL("tir.schedule.ScheduleDecomposeReduction")
+    .set_body_method<Schedule>(&ScheduleNode::DecomposeReduction);
 TVM_REGISTER_GLOBAL("tir.schedule.ScheduleRFactor")
     .set_body_method<Schedule>(&ScheduleNode::RFactor);
 /******** (FFI) Block annotation ********/

@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "./utils.h"
 
@@ -80,19 +81,17 @@ class ConcreteScheduleNode : public ScheduleNode {
 
  public:
   /******** Schedule: Sampling ********/
-  /*!
-   * \brief Sample an integer given the probability distribution
-   * \param candidates The candidates
-   * \param probs The probability distribution of the candidates
-   * \param decision The sampling decision, if it's given we would validate the decision, otherwise
-   *  we would sample a decision from the distribution and set the decision accordingly.
-   * \return The random variable sampled from candidates
-   */
   ExprRV SampleCategorical(const Array<Integer>& candidates, const Array<FloatImm>& probs,
                            Optional<Integer> decision = NullOpt) override;
+  Array<ExprRV> SamplePerfectTile(const LoopRV& loop_rv, int n, int max_innermost_factor,
+                                  Optional<Array<Integer>> decision = NullOpt) override;
   /******** Schedule: Get blocks & loops ********/
   BlockRV GetBlock(const String& name, const String& func_name = "main") override;
   Array<LoopRV> GetLoops(const BlockRV& block_rv) override;
+  Array<BlockRV> GetChildBlocks(const BlockRV& block_rv) override;
+  Array<BlockRV> GetChildBlocks(const LoopRV& loop_rv) override;
+  Array<BlockRV> GetProducers(const BlockRV& block_rv) override;
+  Array<BlockRV> GetConsumers(const BlockRV& block_rv) override;
   /******** Schedule: Transform loops ********/
   LoopRV Fuse(const Array<LoopRV>& loop_rvs) override;
   Array<LoopRV> Split(const LoopRV& loop_rv, const Array<Optional<ExprRV>>& factors) override;
@@ -108,10 +107,14 @@ class ConcreteScheduleNode : public ScheduleNode {
   BlockRV CacheWrite(const BlockRV& block_rv, int write_buffer_index,
                      const String& storage_scope) override;
   /******** Schedule: Compute location ********/
+  void ComputeAt(const BlockRV& block_rv, const LoopRV& loop_rv, bool preserve_unit_loops) override;
+  void ReverseComputeAt(const BlockRV& block_rv, const LoopRV& loop_rv,
+                        bool preserve_unit_loops) override;
   void ComputeInline(const BlockRV& block) override;
   void ReverseComputeInline(const BlockRV& block) override;
   /******** Schedule: Reduction ********/
   BlockRV RFactor(const LoopRV& loop_rv, int factor_axis) override;
+  BlockRV DecomposeReduction(const BlockRV& block_rv, const LoopRV& loop_rv) override;
   /******** Schedule: Block annotation ********/
   void StorageAlign(const BlockRV& block_rv, int buffer_index, int axis, int factor,
                     int offset) override;
@@ -150,6 +153,12 @@ class ConcreteScheduleNode : public ScheduleNode {
    * \return The new random variable created
    */
   inline ExprRV CreateRV(int64_t value);
+  /*!
+   * \brief Add a list of integers as random variables into the symbol table
+   * \param value The list of integers to be added to the symbol table
+   * \return The new random variables created
+   */
+  inline Array<ExprRV> CreateRV(const std::vector<int64_t>& value);
   /*! \brief Remove a random variable from the symbol table */
   inline void RemoveFromSymbolTable(const ObjectRef& rv);
 };
@@ -268,6 +277,15 @@ inline ExprRV ConcreteScheduleNode::CreateRV(int64_t value) {
   Var rv("v" + std::to_string(this->symbol_table_.size() + 1), DataType::Int(32));
   this->symbol_table_.Set(rv, Integer(static_cast<int32_t>(value)));
   return std::move(rv);
+}
+
+inline Array<ExprRV> ConcreteScheduleNode::CreateRV(const std::vector<int64_t>& value) {
+  Array<ExprRV> results;
+  results.reserve(value.size());
+  for (int64_t v : value) {
+    results.push_back(CreateRV(v));
+  }
+  return results;
 }
 
 inline void ConcreteScheduleNode::RemoveFromSymbolTable(const ObjectRef& obj) {

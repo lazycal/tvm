@@ -82,6 +82,7 @@ import tvm._ffi
 from tvm.contrib import nvcc, cudnn
 from tvm.error import TVMError
 from tvm.relay.op.contrib.ethosn import ethosn_available
+from tvm.relay.op.contrib import cmsisnn
 
 
 def assert_allclose(actual, desired, rtol=1e-7, atol=1e-7):
@@ -442,6 +443,7 @@ DEFAULT_TEST_TARGETS = [
     "opencl -device=intel_graphics",
     "metal",
     "rocm",
+    "hexagon",
 ]
 
 
@@ -594,6 +596,27 @@ def requires_cudnn(*args):
     return _compose(args, requirements)
 
 
+def requires_cublas(*args):
+    """Mark a test as requiring the cuBLAS library.
+
+    This also marks the test as requiring a cuda gpu.
+
+    Parameters
+    ----------
+    f : function
+        Function to mark
+    """
+
+    requirements = [
+        pytest.mark.skipif(
+            tvm.get_global_func("tvm.contrib.cublas.matmul", True),
+            reason="cuDNN library not enabled",
+        ),
+        *requires_cuda(),
+    ]
+    return _compose(args, requirements)
+
+
 def requires_nvptx(*args):
     """Mark a test as requiring the NVPTX compilation on the CUDA runtime
 
@@ -649,6 +672,18 @@ def requires_opencl(*args):
         *requires_gpu(),
     ]
     return _compose(args, _requires_opencl)
+
+
+def requires_corstone300(*args):
+    """Mark a test as requiring the corstone300 FVP
+
+    Parameters
+    ----------
+    f : function
+        Function to mark
+    """
+    _requires_corstone300 = [pytest.mark.corstone300]
+    return _compose(args, _requires_corstone300)
 
 
 def requires_rocm(*args):
@@ -776,7 +811,7 @@ def requires_rpc(*args):
 
 
 def requires_ethosn(*args):
-    """Mark a test as requiring ethosn to run.
+    """Mark a test as requiring Arm(R) Ethos(TM)-N to run.
 
     Parameters
     ----------
@@ -788,13 +823,45 @@ def requires_ethosn(*args):
         pytest.mark.skipif(
             not ethosn_available(),
             reason=(
-                "Ethos-N support not enabled.  "
+                "Arm(R) Ethos(TM)-N support not enabled.  "
                 "Set USE_ETHOSN=ON in config.cmake to enable, "
                 "and ensure that hardware support is present."
             ),
         ),
     ]
     return _compose(args, marks)
+
+
+def requires_hexagon(*args):
+    """Mark a test as requiring Hexagon to run.
+
+    Parameters
+    ----------
+    f : function
+        Function to mark
+    """
+    _requires_hexagon = [
+        pytest.mark.hexagon,
+        pytest.mark.skipif(not device_enabled("hexagon"), reason="Hexagon support not enabled"),
+        *requires_llvm(),
+        pytest.mark.skipif(
+            tvm.target.codegen.llvm_version_major() < 7, reason="Hexagon requires LLVM 7 or later"
+        ),
+    ]
+    return _compose(args, _requires_hexagon)
+
+
+def requires_cmsisnn(*args):
+    """Mark a test as requiring the CMSIS NN library.
+
+    Parameters
+    ----------
+    f : function
+        Function to mark
+    """
+
+    requirements = [pytest.mark.skipif(not cmsisnn.enabled(), reason="CMSIS NN not enabled")]
+    return _compose(args, requirements)
 
 
 def requires_package(*packages):
@@ -968,7 +1035,7 @@ def known_failing_targets(*args):
     return wraps
 
 
-def parameter(*values, ids=None):
+def parameter(*values, ids=None, by_dict=None):
     """Convenience function to define pytest parametrized fixtures.
 
     Declaring a variable using ``tvm.testing.parameter`` will define a
@@ -988,15 +1055,22 @@ def parameter(*values, ids=None):
 
     Parameters
     ----------
-    values
+    values : Any
+
        A list of parameter values.  A unit test that accepts this
        parameter as an argument will be run once for each parameter
        given.
 
     ids : List[str], optional
+
        A list of names for the parameters.  If None, pytest will
        generate a name from the value.  These generated names may not
        be readable/useful for composite types such as tuples.
+
+    by_dict : Dict[str, Any]
+
+       A mapping from parameter name to parameter value, to set both the
+       values and ids.
 
     Returns
     -------
@@ -1015,7 +1089,21 @@ def parameter(*values, ids=None):
     >>> def test_using_size(shape):
     >>>     ... # Test code here
 
+    Or
+
+    >>> shape = tvm.testing.parameter(by_dict={'small': (5,10), 'large': (512,1024)})
+    >>> def test_using_size(shape):
+    >>>     ... # Test code here
+
     """
+
+    if by_dict is not None:
+        if values or ids:
+            raise RuntimeError(
+                "Use of the by_dict parameter cannot be used alongside positional arguments"
+            )
+
+        ids, values = zip(*by_dict.items())
 
     # Optional cls parameter in case a parameter is defined inside a
     # class scope.
@@ -1029,7 +1117,7 @@ def parameter(*values, ids=None):
 _parametrize_group = 0
 
 
-def parameters(*value_sets):
+def parameters(*value_sets, ids=None):
     """Convenience function to define pytest parametrized fixtures.
 
     Declaring a variable using tvm.testing.parameters will define a
@@ -1052,10 +1140,17 @@ def parameters(*value_sets):
     Parameters
     ----------
     values : List[tuple]
+
        A list of parameter value sets.  Each set of values represents
        a single combination of values to be tested.  A unit test that
        accepts parameters defined will be run once for every set of
        parameters in the list.
+
+    ids : List[str], optional
+
+       A list of names for the parameter sets.  If None, pytest will
+       generate a name from each parameter set.  These generated names may
+       not be readable/useful for composite types such as tuples.
 
     Returns
     -------
@@ -1085,6 +1180,7 @@ def parameters(*value_sets):
 
         fixture_func.parametrize_group = parametrize_group
         fixture_func.parametrize_values = param_values
+        fixture_func.parametrize_ids = ids
         outputs.append(pytest.fixture(fixture_func))
 
     return outputs

@@ -22,6 +22,7 @@
  */
 #include "codegen_c_host.h"
 
+#include <tvm/relay/executor.h>
 #include <tvm/runtime/crt/error_codes.h>
 #include <tvm/runtime/module.h>
 #include <tvm/target/codegen.h>
@@ -59,6 +60,17 @@ void CodeGenCHost::AddFunction(const PrimFunc& f) {
   function_names_.push_back(global_symbol.value());
 
   CodeGenC::AddFunction(f);
+  if (f->HasNonzeroAttr(tir::attr::kIsEntryFunc)) {
+    function_names_.push_back(runtime::symbol::tvm_module_main);
+    stream << "// CodegenC: NOTE: Auto-generated entry function\n";
+    PrintFuncPrefix();
+    stream << " " << tvm::runtime::symbol::tvm_module_main
+           << "(void* args, int* arg_type_ids, int num_args, void* out_ret_value, "
+           << "int* out_ret_tcode, void* resource_handle) {\n";
+    stream << "  return " << global_symbol.value()
+           << "(args, arg_type_ids, num_args, out_ret_value, out_ret_tcode, resource_handle);\n";
+    stream << "}\n";
+  }
 }
 
 void CodeGenCHost::DeclareParameters(Map<String, LinkedParam> params) {
@@ -373,7 +385,7 @@ runtime::Module BuildCHost(IRModule mod, Target target) {
 
   Map<String, LinkedParam> linked_params;
   bool found_linked_params = false;
-  bool could_have_linked_params = target->GetAttr<Bool>("link-params").value_or(Bool(false));
+  bool could_have_linked_params = mod->ShouldLinkParameters();
   PrimFunc aot_executor_fn;
 
   for (auto kv : mod->functions) {

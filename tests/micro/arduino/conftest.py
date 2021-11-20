@@ -17,44 +17,41 @@
 
 import datetime
 import pathlib
-
+import json
 import pytest
+
 import tvm.target.target
-from tvm import micro, relay
+from tvm.micro import project
+from tvm import relay
+from tvm.relay.backend import Executor, Runtime
 
-# The models that should pass this configuration. Maps a short, identifying platform string to
-# (model, zephyr_board).
-PLATFORMS = {
-    "due": ("sam3x8e", "due"),
-    "feathers2": ("esp32", "feathers2"),
-    "metrom4": ("atsamd51", "metrom4"),
-    "nano33ble": ("nrf52840", "nano33ble"),
-    "pybadge": ("atsamd51", "pybadge"),
-    "spresense": ("cxd5602gg", "spresense"),
-    "teensy40": ("imxrt1060", "teensy40"),
-    "teensy41": ("imxrt1060", "teensy41"),
-    "wioterminal": ("atsamd51", "wioterminal"),
-}
+TEMPLATE_PROJECT_DIR = pathlib.Path(tvm.micro.get_microtvm_template_projects("arduino"))
 
-TEMPLATE_PROJECT_DIR = (
-    pathlib.Path(__file__).parent
-    / ".."
-    / ".."
-    / ".."
-    / "apps"
-    / "microtvm"
-    / "arduino"
-    / "template_project"
-).resolve()
+
+BOARDS = TEMPLATE_PROJECT_DIR / "boards.json"
+
+BOARDS = TEMPLATE_PROJECT_DIR / "boards.json"
+
+
+def arduino_boards() -> dict:
+    """Returns a dict mapping board to target model"""
+    with open(BOARDS) as f:
+        board_properties = json.load(f)
+
+    boards_model = {board: info["model"] for board, info in board_properties.items()}
+    return boards_model
+
+
+ARDUINO_BOARDS = arduino_boards()
 
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--microtvm-platforms",
+        "--arduino-board",
         nargs="+",
         required=True,
-        choices=PLATFORMS.keys(),
-        help="Target platforms for microTVM tests.",
+        choices=ARDUINO_BOARDS.keys(),
+        help="Arduino board for tests.",
     )
     parser.addoption(
         "--arduino-cli-cmd",
@@ -92,8 +89,8 @@ def pytest_collection_modifyitems(config, items):
 # (to take advantage of multiple cores / external memory / etc.), so all tests
 # are parameterized by board
 def pytest_generate_tests(metafunc):
-    platforms = metafunc.config.getoption("microtvm_platforms")
-    metafunc.parametrize("platform", platforms, scope="session")
+    board = metafunc.config.getoption("arduino_board")
+    metafunc.parametrize("board", board, scope="session")
 
 
 @pytest.fixture(scope="session")
@@ -106,12 +103,11 @@ def tvm_debug(request):
     return request.config.getoption("--tvm-debug")
 
 
-def make_workspace_dir(test_name, platform):
-    _, arduino_board = PLATFORMS[platform]
+def make_workspace_dir(test_name, board):
     filepath = pathlib.Path(__file__)
     board_workspace = (
         filepath.parent
-        / f"workspace_{test_name}_{arduino_board}"
+        / f"workspace_{test_name}_{board}"
         / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     )
 
@@ -125,9 +121,9 @@ def make_workspace_dir(test_name, platform):
     return t
 
 
-def make_kws_project(platform, arduino_cli_cmd, tvm_debug, workspace_dir):
+def make_kws_project(board, arduino_cli_cmd, tvm_debug, workspace_dir):
     this_dir = pathlib.Path(__file__).parent
-    model, arduino_board = PLATFORMS[platform]
+    model = ARDUINO_BOARDS[board]
     build_config = {"debug": tvm_debug}
 
     with open(this_dir.parent / "testdata" / "kws" / "yes_no.tflite", "rb") as f:
@@ -144,19 +140,19 @@ def make_kws_project(platform, arduino_cli_cmd, tvm_debug, workspace_dir):
         tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
 
     mod, params = relay.frontend.from_tflite(tflite_model)
-    target = tvm.target.target.micro(
-        model, options=["--link-params=1", "--unpacked-api=1", "--executor=aot"]
-    )
+    target = tvm.target.target.micro(model)
+    runtime = Runtime("crt")
+    executor = Executor("aot", {"unpacked-api": True})
 
     with tvm.transform.PassContext(opt_level=3, config={"tir.disable_vectorize": True}):
-        mod = relay.build(mod, target, params=params)
+        mod = relay.build(mod, target, runtime=runtime, executor=executor, params=params)
 
     return tvm.micro.generate_project(
         str(TEMPLATE_PROJECT_DIR),
         mod,
         workspace_dir / "project",
         {
-            "arduino_board": arduino_board,
+            "arduino_board": board,
             "arduino_cli_cmd": arduino_cli_cmd,
             "project_type": "example_project",
             "verbose": bool(build_config.get("debug")),
