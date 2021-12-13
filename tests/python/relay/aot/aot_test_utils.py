@@ -277,11 +277,17 @@ def emit_data_linkage(output_file, data_linkage):
         )
 
 
-def emit_main_prologue(main_file, custom_prologue, workspace_bytes, data_linkage):
+def emit_main_prologue(
+    main_file, custom_prologue, workspace_bytes, data_linkage, compiled_models, interface_api
+):
     # Add TVM_RUNTIME_ALLOC_ALIGNMENT_BYTES because of memory alignment.
-    main_file.write(
-        f"#define WORKSPACE_SIZE ({workspace_bytes} + TVM_RUNTIME_ALLOC_ALIGNMENT_BYTES)\n"
-    )
+    workspace_define = f"#define WORKSPACE_SIZE ({workspace_bytes}"
+    if interface_api == "c":
+        for compiled_model in compiled_models:
+            model = compiled_model.model
+            workspace_define += f" + TVMGEN_{model.name.upper()}_WORKSPACE_SIZE"
+    workspace_define += " + TVM_RUNTIME_ALLOC_ALIGNMENT_BYTES)\n"
+    main_file.write(workspace_define)
     emit_data_linkage(main_file, data_linkage)
     main_file.write("static uint8_t g_aot_memory[WORKSPACE_SIZE];\n")
     main_file.write("tvm_workspace_t app_workspace;\n")
@@ -516,7 +522,14 @@ def create_main(
             model = compiled_model.model
             emit_main_data(main_file, model.inputs, model.outputs, model.name)
 
-        emit_main_prologue(main_file, custom_prologue, workspace_bytes, data_linkage)
+        emit_main_prologue(
+            main_file,
+            custom_prologue,
+            workspace_bytes,
+            data_linkage,
+            compiled_models,
+            interface_api,
+        )
         emit_main_init_memory_manager(main_file)
 
         if interface_api == "c":
@@ -644,21 +657,26 @@ def run_and_check(
     debug_calculated_workspaces=False,
     workspace_byte_alignment=8,
     data_linkage: AOTDataLinkage = None,
+    test_dir: str = None,
+    verbose: bool = False,
 ):
     """
     This method uses the original test data and compiled runtime.Modules
     to run in the test runner to verify the results.
     """
 
-    tmp_path = utils.tempdir()
-    tmp_dir = tmp_path.temp_dir
+    base_path = test_dir
+    if test_dir is None:
+        tmp_path = utils.tempdir()
+        tmp_dir = tmp_path.temp_dir
+        base_path = os.path.join(tmp_dir, "test")
 
     cflags = f"-DTVM_RUNTIME_ALLOC_ALIGNMENT_BYTES={workspace_byte_alignment} "
     # The calculated workspaces will not account for stack allocator tags used for debugging
     if debug_calculated_workspaces:
         cflags += "-DTVM_CRT_STACK_ALLOCATOR_ENABLE_LIFO_CHECK "
 
-    base_path = os.path.join(tmp_dir, "test")
+    base_path = os.path.abspath(base_path)
     build_path = os.path.join(base_path, "build")
     os.makedirs(build_path, exist_ok=True)
 
@@ -679,7 +697,8 @@ def run_and_check(
         t.extractall(base_path)
 
         workspace_bytes += model.extra_memory_in_bytes
-        workspace_bytes += mlf_extract_workspace_size_bytes(tar_file)
+        if interface_api == "packed":
+            workspace_bytes += mlf_extract_workspace_size_bytes(tar_file)
 
         for key in model.inputs:
             sanitized_tensor_name = re.sub(r"\W", "_", key)
@@ -720,6 +739,10 @@ def run_and_check(
     file_dir = os.path.dirname(os.path.abspath(__file__))
     codegen_path = os.path.join(base_path, "codegen")
     makefile = os.path.join(file_dir, f"{runner.makefile}.mk")
+    fvp_dir = "/opt/arm/FVP_Corstone_SSE-300/models/Linux64_GCC-6.4/"
+    # TODO(@grant-arm): Remove once ci_cpu docker image has been updated to FVP_Corstone_SSE
+    if not os.path.isdir(fvp_dir):
+        fvp_dir = "/opt/arm/FVP_Corstone_SSE-300_Ethos-U55/models/Linux64_GCC-6.4/"
     custom_params = " ".join([f" {param}='{value}'" for param, value in runner.parameters.items()])
     make_command = (
         f"make -f {makefile} build_dir={build_path}"
@@ -728,17 +751,22 @@ def run_and_check(
         + f" AOT_TEST_ROOT={file_dir}"
         + f" CODEGEN_ROOT={codegen_path}"
         + f" STANDALONE_CRT_DIR={tvm.micro.get_standalone_crt_dir()}"
+        + f" FVP_DIR={fvp_dir}"
         + custom_params
     )
 
     compile_log_path = os.path.join(build_path, "test_compile.log")
     compile_command = f"{make_command} aot_test_runner"
+    if verbose:
+        print("Compile command:\n", compile_command)
     ret = subprocess_log_output(compile_command, ".", compile_log_path)
     assert ret == 0
 
     # Verify that runs fine
     run_log_path = os.path.join(build_path, "test_run.log")
     run_command = f"{make_command} run"
+    if verbose:
+        print("Run command:\n", run_command)
     ret = subprocess_log_output(run_command, build_path, run_log_path)
     assert ret == 0
 
@@ -758,8 +786,18 @@ def compile_and_run(
     use_runtime_executor: bool = True,
     target: str = "c",
     target_opts: Dict = None,
+    test_dir: str = None,
+    verbose: bool = False,
 ):
-    """This is a wrapper API to compile and run models as test for AoT"""
+    """This is a wrapper API to compile and run models as test for AoT
+
+    Parameters
+    ----------
+    test_dir : str
+        This path will contain build, codegen, include directories
+    verbose: bool
+        Prints commands to build and run AOT test runner
+    """
     compiled_test_mods = compile_models(
         models=models,
         interface_api=interface_api,
@@ -778,6 +816,8 @@ def compile_and_run(
         debug_calculated_workspaces=debug_calculated_workspaces,
         workspace_byte_alignment=workspace_byte_alignment,
         data_linkage=data_linkage,
+        test_dir=test_dir,
+        verbose=verbose,
     )
 
 

@@ -67,31 +67,32 @@ def make_model(
     w_index = weight_format.index("W")
     kernel_h = kernel_shape[h_index]
     kernel_w = kernel_shape[w_index]
-    a = relay.var("input", shape=shape, dtype=dtype)
+    invar = relay.var("input", shape=shape, dtype=dtype)
     p = (0, 0, 0, 0)
+    if padding == "INVALID":
+        p = [1, 2, 1, 2]
     if padding == "SAME":
         p = get_same_padding((shape[1], shape[2]), (kernel_h, kernel_w), dilation, strides)
-        a = relay.nn.pad(
-            a,
+        invar = relay.nn.pad(
+            invar,
             pad_width=[(0, 0), (p[0], p[2]), (p[1], p[3]), (0, 0)],
             pad_value=input_zero_point,
             pad_mode="constant",
         )
         shape = (shape[0], shape[1] + p[0] + p[2], shape[2] + p[1] + p[3], shape[3])
 
-    weight_shape = (kernel_h, kernel_w, shape[3] // groups, out_channels)
     rng = np.random.default_rng(12321)
     w = tvm.nd.array(
         rng.integers(
             np.iinfo(kernel_dtype).min,
             high=np.iinfo(kernel_dtype).max,
-            size=weight_shape,
+            size=kernel_shape,
             dtype=kernel_dtype,
         )
     )
     weight_const = relay.const(w, kernel_dtype)
     conv = relay.qnn.op.conv2d(
-        a,
+        invar,
         weight_const,
         input_zero_point=relay.const(input_zero_point, "int32"),
         kernel_zero_point=relay.const(kernel_zero_point, "int32"),
@@ -128,14 +129,14 @@ def make_model(
 @pytest.mark.parametrize("ifm_shape", [(1, 28, 28, 12), (1, 64, 100, 4)])
 @pytest.mark.parametrize("kernel_size", [(3, 3)])
 @pytest.mark.parametrize("padding", ["SAME", "VALID"])
-@pytest.mark.parametrize("strides, dilation", [((2, 2), (1, 1)), ((1, 1), (1, 1))])
+@pytest.mark.parametrize("strides, dilation", [((1, 1), (1, 1))])
+@pytest.mark.parametrize("relu_type", ["RELU"])
 @pytest.mark.parametrize("enable_bias", [True, False])
-@pytest.mark.parametrize("relu_type", ["NONE", "RELU"])
 @pytest.mark.parametrize(
     "input_zero_point, input_scale, kernel_scale, out_channels",
     [(10, 0.0128, [0.11, 0.22], 2), (-64, 1, [1, 0.0256, 1.37], 3)],
 )
-def test_op_int8(
+def test_conv2d_int8(
     ifm_shape,
     kernel_size,
     padding,
@@ -152,22 +153,17 @@ def test_op_int8(
     use_unpacked_api = True
     test_runner = AOT_CORSTONE300_RUNNER
 
-    kernel_zero_point = 0
+    dtype = "int8"
     groups = 1
     weight_format = "HWIO"
     kernel_h = kernel_size[0]
     kernel_w = kernel_size[1]
-    dtype = "int8"
+    kernel_shape = (kernel_h, kernel_w, ifm_shape[3] // groups, out_channels)
+    kernel_zero_point = 0
     in_min, in_max = get_range_for_dtype_str(dtype)
 
-    weight_shape = None
-    if weight_format == "HWIO":
-        weight_shape = (kernel_h, kernel_w, ifm_shape[3] // groups, out_channels)
-    else:
-        weight_shape = (kernel_h, kernel_w, ifm_shape[3], out_channels)
-
     output_scale, output_zero_point = get_conv2d_qnn_params(
-        weight_shape,
+        kernel_shape,
         input_scale,
         input_zero_point,
         kernel_scale,
@@ -175,12 +171,129 @@ def test_op_int8(
         dtype,
         dtype,
         dtype,
-        False,
     )
 
     model, params = make_model(
         ifm_shape,
-        weight_shape,
+        kernel_shape,
+        input_zero_point,
+        input_scale,
+        kernel_zero_point,
+        kernel_scale,
+        output_zero_point,
+        output_scale,
+        padding,
+        strides,
+        dilation,
+        groups,
+        dtype,
+        dtype,
+        out_channels,
+        weight_format,
+        enable_bias,
+        relu_type,
+    )
+    orig_mod = make_module(model)
+    cmsisnn_mod = cmsisnn.partition_for_cmsisnn(orig_mod, params)
+
+    # validate pattern matching
+    attrs = [
+        cmsisnn_mod[var.name_hint].attrs
+        for var in cmsisnn_mod.get_global_vars()
+        if cmsisnn_mod[var.name_hint].attrs
+    ]
+    assert any(attrs), "At least one function with external attributes was expected."
+
+    compilers = [
+        key == "Compiler" and value == "cmsis-nn" for attr in attrs for key, value in attr.items()
+    ]
+    assert any(compilers), "Module does not contain function for cmsis-nn target."
+
+    assert count_num_calls(orig_mod) == count_num_calls(
+        cmsisnn_mod
+    ), "Number of calls changed during partitioning"
+
+    # validate the output
+    rng = np.random.default_rng(12345)
+    inputs = {"input": rng.integers(in_min, high=in_max, size=ifm_shape, dtype=dtype)}
+    output_list = generate_ref_data(orig_mod["main"], inputs, params)
+    compile_and_run(
+        AOTTestModel(
+            module=cmsisnn_mod,
+            inputs=inputs,
+            outputs=output_list,
+            params=params,
+            output_tolerance=1,
+        ),
+        test_runner,
+        interface_api,
+        use_unpacked_api,
+    )
+
+
+@tvm.testing.requires_cmsisnn
+@pytest.mark.parametrize("ifm_shape", [(1, 28, 28, 12), (1, 64, 100, 4)])
+@pytest.mark.parametrize("kernel_size", [(3, 3)])
+@pytest.mark.parametrize("padding", ["SAME", "VALID"])
+@pytest.mark.parametrize("strides, dilation", [((1, 1), (1, 1))])
+@pytest.mark.parametrize("relu_type", ["RELU"])
+@pytest.mark.parametrize(
+    "depth_multiplier, enable_bias",
+    [(1, True), (3, True)],
+)
+@pytest.mark.parametrize(
+    "input_zero_point, input_scale, kernel_scale, out_channels",
+    [(10, 0.0128, [0.11, 0.22], 2), (-64, 1, [1, 0.0256, 1.37], 3)],
+)
+def test_depthwise_int8(
+    ifm_shape,
+    kernel_size,
+    padding,
+    strides,
+    dilation,
+    enable_bias,
+    relu_type,
+    input_zero_point,
+    input_scale,
+    kernel_scale,
+    out_channels,
+    depth_multiplier,
+):
+    interface_api = "c"
+    use_unpacked_api = True
+    test_runner = AOT_CORSTONE300_RUNNER
+
+    dtype = "int8"
+    groups = 1
+    weight_format = "HWIO"
+    kernel_h = kernel_size[0]
+    kernel_w = kernel_size[1]
+    kernel_shape = (kernel_h, kernel_w, ifm_shape[3] // groups, out_channels)
+    kernel_zero_point = 0
+    in_min, in_max = get_range_for_dtype_str(dtype)
+
+    groups = ifm_shape[3]
+    weight_format = "HWOI"
+    kernel_shape = (kernel_h, kernel_w, ifm_shape[3], depth_multiplier)
+    out_channels = ifm_shape[3] * depth_multiplier
+    ks_len = len(kernel_scale)
+    kernel_scale = [kernel_scale[i % ks_len] for i in range(out_channels)]
+
+    output_scale, output_zero_point = get_conv2d_qnn_params(
+        kernel_shape,
+        input_scale,
+        input_zero_point,
+        kernel_scale,
+        kernel_zero_point,
+        dtype,
+        dtype,
+        dtype,
+        True,
+    )
+
+    model, params = make_model(
+        ifm_shape,
+        kernel_shape,
         input_zero_point,
         input_scale,
         kernel_zero_point,
@@ -240,15 +353,19 @@ def parameterize_for_invalid_model(test):
     in_dtype = ["uint8", "int8"]
     kernel_dtype = ["uint8", "int8"]
     kernel_zero_point = [-33, 10, 0]
-    all_combinations = itertools.product(in_dtype, kernel_dtype, kernel_zero_point)
+    padding = ["SAME", "INVALID"]
+    all_combinations = itertools.product(in_dtype, kernel_dtype, kernel_zero_point, padding)
     all_combinations = filter(
         lambda parameters: not (
-            parameters[0] == "int8" and parameters[1] == "int8" and parameters[2] == 0
+            parameters[0] == "int8"
+            and parameters[1] == "int8"
+            and parameters[2] == 0
+            and parameters[3] == "SAME"
         ),
         all_combinations,
     )
     return pytest.mark.parametrize(
-        ["in_dtype", "kernel_dtype", "kernel_zero_point"],
+        ["in_dtype", "kernel_dtype", "kernel_zero_point", "padding"],
         all_combinations,
     )(test)
 
@@ -259,6 +376,7 @@ def test_invalid_parameters(
     in_dtype,
     kernel_dtype,
     kernel_zero_point,
+    padding,
 ):
     ifm_shape = (1, 28, 28, 12)
     out_channels = 2
@@ -289,7 +407,7 @@ def test_invalid_parameters(
         kernel_scale=kernel_scale,
         output_zero_point=output_zero_point,
         output_scale=output_scale,
-        padding="SAME",
+        padding=padding,
         strides=(1, 1),
         dilation=(1, 1),
         groups=1,
