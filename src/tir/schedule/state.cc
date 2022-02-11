@@ -104,9 +104,9 @@ bool ProducerCoversConsumer(const Array<PrimExpr>& buffer_shape,
     arith::IntSet produced = arith::Intersect({produced_region[i], buffer_size});
     arith::IntSet consumed = arith::Intersect({consumed_region[i], buffer_size});
     PrimExpr produced_min = analyzer->Simplify(produced.min());
-    PrimExpr produced_max = analyzer->Simplify(produced.max() - produced_min + 1);
+    PrimExpr produced_max = analyzer->Simplify(produced.max());
     PrimExpr consumed_min = analyzer->Simplify(consumed.min());
-    PrimExpr consumed_max = analyzer->Simplify(consumed.max() - consumed_min + 1);
+    PrimExpr consumed_max = analyzer->Simplify(consumed.max());
     if (!analyzer->CanProve((produced_min <= consumed_min) && (consumed_max <= produced_max))) {
       return false;
     }
@@ -201,9 +201,7 @@ class BlockInfoCollector : private StmtVisitor {
     bool is_root_block = srefs_.empty();
     // Calculate `BlockInfo::scope`
     Array<StmtSRef> child_block_srefs = std::move(block_frames_.back());
-    BlockInfo& info =
-        self_->block_info.emplace(scope_root, BlockInfo(BlockScope(child_block_srefs)))
-            .first->second;
+    BlockInfo& info = self_->block_info[scope_root] = BlockInfo(BlockScope(child_block_srefs));
     // Set `affine_binding`
     if (is_root_block) {
       // If the block doesn't have outer loops and BlockRealize,

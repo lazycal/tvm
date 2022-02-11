@@ -896,6 +896,15 @@ def test_forward_avgpool2d():
         torch.nn.AvgPool2d(kernel_size=5, stride=2, padding=2).eval(), input_data=input_data
     )
 
+    input_shape = [1, 1, 1, 9]
+    input_data = torch.rand(input_shape).float()
+    verify_model(
+        torch.nn.AvgPool2d(
+            kernel_size=[1, 2], stride=[1, 2], ceil_mode=True, count_include_pad=True
+        ).eval(),
+        input_data=input_data,
+    )
+
 
 @tvm.testing.uses_gpu
 def test_forward_avgpool3d():
@@ -2682,6 +2691,13 @@ def test_forward_rsub():
     verify_model(Rsub2().float().eval(), input_data=[d1, d2])
     verify_model(Rsub2().float().eval(), input_data=[d1, d3])
 
+    d1 = torch.rand([1, 3]).half()
+    d2 = torch.rand([1, 3]).half()
+    verify_model(Rsub1().half().eval(), input_data=[d1, d2])
+    verify_model(Rsub1().half().eval(), input_data=[d1, d3])
+    verify_model(Rsub2().half().eval(), input_data=[d1, d2])
+    verify_model(Rsub2().half().eval(), input_data=[d1, d3])
+
 
 @tvm.testing.uses_gpu
 def test_forward_embedding():
@@ -2780,6 +2796,10 @@ def test_forward_clamp():
     verify_model(Clamp2().float().eval(), input_data=input_data)
     verify_model(Clamp3().float().eval(), input_data=input_data)
     verify_model(Clamp_MinExpr_MaxConstant().float().eval(), input_data=input_data)
+
+    verify_model(lambda inp: torch.clamp_min(inp, 0.5), input_data)
+    inp_uint8 = torch.randint(low=0, high=256, size=(100, 100), dtype=torch.uint8)
+    verify_model(lambda inp: torch.clamp_max(inp, 125), inp_uint8)
 
 
 @tvm.testing.uses_gpu
@@ -4038,6 +4058,25 @@ def test_einsum():
     z = torch.ones([4, 5])
     verify_model(test_fn("ij,jk"), [x, y])
     verify_model(test_fn("ij,jk,km->im"), [x, y, z])
+
+
+@tvm.testing.uses_gpu
+def test_dot():
+    def test_fn(x):
+        return x.dot(x)
+
+    x = torch.randn([4])
+    verify_model(test_fn, [x])
+
+
+@tvm.testing.uses_gpu
+def test_mv():
+    def test_fn(m, v):
+        return m.mv(v)
+
+    verify_model(test_fn, [torch.randn(4, 4), torch.randn(4)])
+    verify_model(test_fn, [torch.randn(2, 2), torch.randn(2)])
+    verify_model(test_fn, [torch.randn(3, 8), torch.randn(8)])
 
 
 if __name__ == "__main__":
