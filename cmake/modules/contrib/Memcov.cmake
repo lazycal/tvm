@@ -14,4 +14,9 @@ if(USE_COV)
 
     list(APPEND TVM_LINKER_LIBS memcov)
     list(APPEND TVM_RUNTIME_LINKER_LIBS memcov)
+
+endif()
+if(USE_ASTCOV)
+    tvm_file_glob(GLOB SOURCECOV_CONTRIB_SRC src/contrib/source_cov.cc)
+    list(APPEND COMPILER_SRCS ${SOURCECOV_CONTRIB_SRC})
 endif()
